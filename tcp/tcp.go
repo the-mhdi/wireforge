@@ -1,11 +1,30 @@
 package tcp
 
 import (
+	"context"
 	"net"
 )
 
-func Listen(addr string, handler handlerFunc) error {
-	ln := NewListener(DefaultListenOptions())
+func Listen(addr string, handler handlerFunc, options *ListenOptions) error {
+	if options == nil {
+		options = DefaultListenOptions()
+	}
+	ln := NewListener(options)
+	err := ln.Initialize(addr, handler)
+	if err != nil {
+		return err
+	}
+
+	ln.Run()
+
+	return nil
+}
+
+func ListenWithContext(ctx context.Context, addr string, handler handlerFunc, options *ListenOptions) error {
+	if options == nil {
+		options = DefaultListenOptions()
+	}
+	ln := NewListenerWithContext(ctx, options)
 	err := ln.Initialize(addr, handler)
 	if err != nil {
 		return err

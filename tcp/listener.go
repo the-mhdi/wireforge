@@ -35,6 +35,9 @@ type Listener struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	ErrCh          chan error
+
+	connCountMu sync.RWMutex
+	connCount   map[net.Addr]uint
 }
 
 type ListenOptions struct {
@@ -61,6 +64,8 @@ type ListenOptions struct {
 
 	//incomming connections configuration
 	Inbounds InboundConnOptions
+
+	MaxConnectionsPerIP uint // 0 == no limit
 }
 
 // keepAlive options on ListenOptions gets applied to all Incoming conncetions
@@ -116,6 +121,7 @@ func (lo *ListenOptions) newListenerWithContext(ctx context.Context) *Listener {
 		ErrCh:          make(chan error, 3),
 		ctx:            ctx,
 		cancel:         cancel,
+		connCount:      make(map[net.Addr]uint),
 	}
 
 	return ln
@@ -148,7 +154,7 @@ func (ln *Listener) Initialize(addr string, handler func(context.Context, net.Co
 	defer ln.mu.Unlock()
 
 	if ln.isListening {
-		panic("[wireforge PANIC] :::: TCP Listener Already Listening")
+		panic("[PANIC] :::: TCP Listener Already Listening")
 	}
 
 	var err error
@@ -240,11 +246,14 @@ func (ln *Listener) acceptLoop(handler func(context.Context, net.Conn)) {
 			if ln.Options.Inbounds.Deadline > 0 {
 				tcpConn.SetDeadline(time.Now().Add(ln.Options.Inbounds.Deadline))
 			}
+			if ln.Options.MaxConnectionsPerIP != 0 && ln.incrementConnCount(tcpConn.RemoteAddr()) > ln.Options.MaxConnectionsPerIP {
+				log.Printf("[wireforge] :::: reached max number of connections for this ip %s", tcpConn.RemoteAddr().String())
+				inbound.Close()
+			}
 
 		}
 
 		ln.wg.Add(1)
-
 		go func(lsn *Listener, c net.Conn, handlerFunc func(context.Context, net.Conn)) {
 			defer lsn.wg.Done()
 
@@ -359,6 +368,20 @@ func (ln *Listener) acceptLoop(handler func(context.Context, net.Conn)) {
 		}(ln, inbound, handler)
 
 	}
+}
+
+func (ln *Listener) incrementConnCount(addr net.Addr) (currentCount uint) {
+	ln.connCountMu.Lock()
+	defer ln.connCountMu.Unlock()
+	if _, ok := ln.connCount[addr]; ok {
+		ln.connCount[addr]++
+		return ln.connCount[addr]
+
+	} else {
+		ln.connCount[addr] = 1
+		return ln.connCount[addr]
+	}
+	//return ln.connCount.Add(1)
 }
 
 // just a blocking call waiting for the main listener to be shutdown
@@ -573,6 +596,7 @@ func DefaultListenOptions() *ListenOptions {
 		KeepAliveFirstProbe:  0, //== def 15
 		KeepAliveInterval:    0, //== def 15
 		MaxKeepAliveAttempts: 0, //== def 9
+
 	}
 
 	return &ListenOptions{
@@ -588,6 +612,7 @@ func DefaultListenOptions() *ListenOptions {
 		OnDisconnect:        nil,
 		OnDisconnectTimeout: 0,
 		ShutdownTimeout:     15 * time.Second,
+		MaxConnectionsPerIP: 0,
 	}
 }
 
