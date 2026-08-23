@@ -2,70 +2,79 @@ package tcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"go.uber.org/atomic"
+
 	"golang.org/x/sys/unix"
 )
 
+type acceptErrClass int
+
+const (
+	acceptErrFatal    acceptErrClass = iota // listener is broken; exit the loop
+	acceptErrBackoff                        // transient (EMFILE etc.); sleep and retry
+	acceptErrRetryNow                       // client-side noise; retry immediately
+)
+
 type handlerFunc func(ctx context.Context, conn net.Conn)
-type OnConnectFunc func(ctx context.Context, conn net.Conn) error // Called on connection accept
-type OnDisconnectFunc func(ctx context.Context, conn net.Conn)    // Called on disconnect
 
 type Listener struct {
-	//todo -> max connection allowed
 	Address     string
 	isListening bool
 	listener    net.Listener
 	config      *net.ListenConfig
 	Options     *ListenOptions
 
-	AcceptPool sync.Map //map of connections that have been accepted by the listener but not yet completed the OnConnect task
+	connectionPool sync.Map
 
-	ConnectionPool sync.Map //map of active connections that have passed the onconnect task
-	mu             sync.RWMutex
-	wg             sync.WaitGroup
-	ctx            context.Context
-	cancel         context.CancelFunc
-	ErrCh          chan error
+	mu     sync.RWMutex
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	ipConnCountMu sync.RWMutex
+	ipConnCount   map[string]atomic.Uint32
 
 	connCountMu sync.RWMutex
-	connCount   map[net.Addr]uint
+	connCount   atomic.Uint32
+
+	ErrCh     chan error
+	errMu     sync.Mutex // guards ErrCh sends and close
+	errClosed bool
 }
 
 type ListenOptions struct {
 	Verbose bool
 
-	ReuseAddr    bool // Bypass TIME_WAIT on restart
-	ReusePort    bool // Leave false by default unless specifically needed, Allow multiple listeners on the same port for multi-core scaling
-	TCPFastOpen  bool
-	MultipathTCP bool //only works if OS supports
+	//incomming connections configuration
+	Inbounds InboundConnOptions
 
-	//events
-	//Connection Hooks
+	ReuseAddr bool // Bypass TIME_WAIT on restart
+	ReusePort bool // Leave false by default unless specifically needed, Allow multiple listeners on the same port for multi-core scaling
 
-	OnConnect func(context.Context, net.Conn) error //executes before handler gets called, after connection gets accepted and before being added to the pool, nil by deault.
-
-	OnConnectTimeout time.Duration // closes the conncetion when timeout reached // default is 0 = no timeout
-
-	OnDisconnect func(context.Context, net.Conn) //executes after connection closes and deleted from the pool, nil by deault, Cleanup hook
-
-	OnDisconnectTimeout time.Duration //default is 0
+	//TCPFastOpen  bool
+	TCPFastOpenQueue int  //default 256
+	MultipathTCP     bool //only works if OS supports
 
 	//the max time the Stop() method can try closing and draining the remaining connections for a graceful shutdown
 	ShutdownTimeout time.Duration //default 15s
 
-	//incomming connections configuration
-	Inbounds InboundConnOptions
+	MaxConnections      uint32
+	MaxConnectionsPerIP uint32 // 0 == no limit
 
-	MaxConnectionsPerIP uint // 0 == no limit
+	AcceptFailureRetryDelay time.Duration // default is 5ms, exponential backoff up to 1s
+
 }
 
 // keepAlive options on ListenOptions gets applied to all Incoming conncetions
@@ -74,11 +83,11 @@ type InboundConnOptions struct {
 	WriteBuffer int  // default is 0 = Let OS Auto-Tune dynamically
 	ReadBuffer  int  // default is 0 = Let OS Auto-Tune dynamically
 
-	Deadline time.Duration //== absolute deadline , default is 0 == no timeout //the absolute time that server lives
+	Deadline time.Duration //== absolute deadline , default is 0 == no timeout //the absolute time that an inbound conncetion lives
 
 	DrainConnectionOnClose int // default -1 // == Linger//by default (-1) the operating system finishes sending the data in the background
 
-	KeepAlive bool // Time between Keep-Alive probes
+	KeepAlive bool
 
 	// the time before the first keep-alive probe is sent.
 	KeepAliveFirstProbe time.Duration // If zero, a default value of 15 seconds is used.
@@ -116,12 +125,13 @@ func (lo *ListenOptions) newListenerWithContext(ctx context.Context) *Listener {
 
 	ln := &Listener{
 		Options:        lo,
-		ConnectionPool: sync.Map{},
+		connectionPool: sync.Map{},
 		config:         lo.convertToListenConfig(),
 		ErrCh:          make(chan error, 3),
 		ctx:            ctx,
 		cancel:         cancel,
-		connCount:      make(map[net.Addr]uint),
+		ipConnCount:    make(map[string]atomic.Uint32),
+		//connCount:      atomic.Uint32{},
 	}
 
 	return ln
@@ -136,7 +146,7 @@ func (lo *ListenOptions) ListenWithContext(ctx context.Context, addr string, han
 		return
 	}
 
-	ln.Run()
+	ln.RunUntilSignal()
 
 }
 
@@ -144,6 +154,15 @@ func (lo *ListenOptions) ListenWithContext(ctx context.Context, addr string, han
 // for more control over the life cycle of your listener see NewListener() and listener.Initialize() and Run() method
 func (lo *ListenOptions) Listen(addr string, handler func(context.Context, net.Conn)) {
 	lo.ListenWithContext(context.Background(), addr, handler)
+
+}
+
+func (ln *Listener) Listen(addr string, handler func(context.Context, net.Conn)) {
+	if ln.Options == nil {
+		ln.Options = DefaultListenOptions()
+	}
+
+	ln.Options.ListenWithContext(context.Background(), addr, handler)
 
 }
 
@@ -192,41 +211,79 @@ func (ln *Listener) acceptLoop(handler func(context.Context, net.Conn)) {
 				log.Printf("[Log] :::: Listener shutting down...")
 				return
 
-			case ln.ErrCh <- fmt.Errorf("Accept Failure - retry in %v: %v", tempDelay, err):
+			//case ln.ErrCh <- fmt.Errorf("Accept Failure - retry in %v: %v", tempDelay, err):
 
 			default:
 				// If channel is full, we log to stderr so we don't lose the error
-				log.Printf("[wireforge] Error channel full, dropped error: %v", err)
+				//	log.Printf("[wireforge] Error channel full, dropped error: %v", err)
 			}
 
+			ln.sendError(fmt.Errorf("Accept Failure - retry in %v: %v", tempDelay, err))
+
 			// Handle temporary errors (like running out of File Descriptors)
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			switch classifyAcceptError(err) {
+
+			case acceptErrBackoff:
 				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
+					if ln.Options.AcceptFailureRetryDelay != 0 {
+						tempDelay = ln.Options.AcceptFailureRetryDelay
+					} else {
+						tempDelay = 5 * time.Millisecond
+					}
 				} else {
 					tempDelay *= 2
 				}
 				if max := 1 * time.Second; tempDelay > max {
 					tempDelay = max
 				}
-				if ln.Options.Verbose {
-					log.Printf("[wireforge] :::: Listener Accept Loop Error: %v; retrying in %v", err, tempDelay)
+
+				// Log unconditionally, not just Verbose: this class means
+				// "the server cannot take new connections right now".
+				log.Printf("[wireforge] :::: Accept error on %s, retrying in %v: %v",
+					ln.Address, tempDelay, err)
+
+				// Nap, but abort instantly if shutdown starts, so Stop()
+				// never waits out a backoff timer.
+				timer := time.NewTimer(tempDelay)
+				select {
+				case <-timer.C:
+				case <-ln.ctx.Done():
+					timer.Stop()
+					return
 				}
-				time.Sleep(tempDelay)
 				continue
+
+			case acceptErrRetryNow:
+				continue
+
+			default:
+				// Genuinely fatal (EBADF, EINVAL, ENOTSOCK, ...): the listener
+				// is unusable. Report it, wake Run(), and get out.
+				fatalErr := fmt.Errorf("fatal accept error on %s: %w", ln.Address, err)
+				log.Print(fatalErr)
+				ln.sendError(fatalErr)
+				ln.cancel() // without this, Run() blocks until SIGINT with a dead listener
+				return
 			}
-
-			// For fatal errors (like listener closed), exit the loop
-
-			log.Printf("[Log] Exiting Listener Accept Loop : %v", err)
-
-			return
 		}
 
 		tempDelay = 0 // Reset delay on success
 
 		// Post-Accept Tuning
 		if tcpConn, ok := inbound.(*net.TCPConn); ok {
+			ln.incrementConnCount(tcpConn.RemoteAddr())
+
+			if ln.Options.MaxConnections != 0 && ln.getConnCount() >= ln.Options.MaxConnections {
+				log.Printf("[wireforge] :::: reached max number of connections")
+				inbound.Close()
+				continue
+			}
+
+			if ln.Options.MaxConnectionsPerIP != 0 && ln.getIpConnCount(tcpConn.RemoteAddr()) > ln.Options.MaxConnectionsPerIP {
+				log.Printf("[wireforge] :::: reached max number of connections for this ip %s", tcpConn.RemoteAddr().String())
+				inbound.Close()
+				continue
+			}
 
 			tcpConn.SetNoDelay(ln.Options.Inbounds.NoDelay)
 
@@ -246,18 +303,14 @@ func (ln *Listener) acceptLoop(handler func(context.Context, net.Conn)) {
 			if ln.Options.Inbounds.Deadline > 0 {
 				tcpConn.SetDeadline(time.Now().Add(ln.Options.Inbounds.Deadline))
 			}
-			if ln.Options.MaxConnectionsPerIP != 0 && ln.incrementConnCount(tcpConn.RemoteAddr()) > ln.Options.MaxConnectionsPerIP {
-				log.Printf("[wireforge] :::: reached max number of connections for this ip %s", tcpConn.RemoteAddr().String())
-				inbound.Close()
-			}
 
 		}
 
 		ln.wg.Add(1)
 		go func(lsn *Listener, c net.Conn, handlerFunc func(context.Context, net.Conn)) {
 			defer lsn.wg.Done()
-
 			defer c.Close()
+			defer lsn.decrementConnCount(c.RemoteAddr())
 
 			defer func() {
 				if r := recover(); r != nil {
@@ -268,92 +321,15 @@ func (ln *Listener) acceptLoop(handler func(context.Context, net.Conn)) {
 				}
 			}()
 
-			// Add connection to pool
-			lsn.AcceptPool.Store(c, struct{}{})
-			defer lsn.AcceptPool.Delete(c)
-
 			if lsn.Options.Verbose {
 				log.Printf("[wireforge] :::: New CONNECTION [ %s ] ACCEPTED by the Listener [ %s ] ", c.RemoteAddr().String(), lsn.Address)
 			}
 
-			//OnConnect() function called on connection accept
-			if lsn.Options.OnConnect != nil {
-
-				if lsn.Options.OnConnectTimeout > 0 {
-					// Create a specific sub-context for this timeout hook
-					cCtx, cancel := context.WithTimeout(lsn.ctx, lsn.Options.OnConnectTimeout)
-
-					resCh := make(chan error, 1)
-
-					// 2. Call onconnect with explicit parameter passing
-					go func(ctx context.Context, conn net.Conn) {
-
-						//panic recovery
-						defer func() {
-							if r := recover(); r != nil {
-								lsn.sendError(fmt.Errorf("onConnect panic recovered: %v", r))
-							}
-						}()
-
-						//call the user's onConnect function implementation
-						resCh <- lsn.Options.OnConnect(ctx, conn)
-					}(cCtx, c)
-
-					select {
-					case <-cCtx.Done():
-						// The timer ran out!
-						cancel()
-						lsn.sendError(fmt.Errorf("onConnect timed out for %s", c.RemoteAddr()))
-						return // Connection closes by defer
-
-					case err := <-resCh:
-						// The hook finished in time
-						cancel()
-
-						if err != nil {
-							lsn.sendError(fmt.Errorf("onConnect rejected %s: %w", c.RemoteAddr(), err))
-							return
-						}
-					}
-
-				}
-				//if no timeout is set for onconnection()
-				if lsn.Options.OnConnectTimeout == 0 {
-
-					err := lsn.Options.OnConnect(lsn.ctx, c)
-
-					if err != nil {
-						lsn.sendError(fmt.Errorf("onConnect rejected %s: %w", c.RemoteAddr(), err))
-						return
-					}
-				}
-
-				//log successful onconnect execution
-				if lsn.Options.Verbose {
-					log.Printf("[wireforge] :::: OnConnect Function Executed Successfully")
-				}
-
-			}
-
-			lsn.AcceptPool.Delete(c)
-
-			lsn.ConnectionPool.Store(c, struct{}{})
-			defer lsn.ConnectionPool.Delete(c)
+			lsn.connectionPool.Store(c, struct{}{})
+			defer lsn.connectionPool.Delete(c)
 
 			//onDisconnect being here ensures that it only fires if onConnect has been successful,
 			// if this go routine is returned at onConnect (if the connection is rejected by onConnect), the onDisconnect logic won't be executed
-			defer func() {
-				if lsn.Options.OnDisconnect != nil {
-
-					if lsn.Options.OnDisconnectTimeout > 0 {
-						dCtx, dCancel := context.WithTimeout(lsn.ctx, lsn.Options.OnDisconnectTimeout)
-						defer dCancel()
-						lsn.Options.OnDisconnect(dCtx, c)
-					} else {
-						lsn.Options.OnDisconnect(lsn.ctx, c)
-					}
-				}
-			}()
 
 			if lsn.Options.Verbose {
 				log.Printf("[wireforge] :::: CONNECTION ESTABLISHED --- [ %s ] CONNECTED to Listener [ %s ] ", c.RemoteAddr().String(), lsn.Address)
@@ -370,59 +346,138 @@ func (ln *Listener) acceptLoop(handler func(context.Context, net.Conn)) {
 	}
 }
 
-func (ln *Listener) incrementConnCount(addr net.Addr) (currentCount uint) {
-	ln.connCountMu.Lock()
-	defer ln.connCountMu.Unlock()
-	if _, ok := ln.connCount[addr]; ok {
-		ln.connCount[addr]++
-		return ln.connCount[addr]
+func (ln *Listener) incrementConnCount(addr net.Addr) {
 
+	ln.connCountMu.Lock()
+	ln.connCount.Inc()
+	ln.connCountMu.Unlock()
+
+	ln.ipConnCountMu.Lock()
+	defer ln.ipConnCountMu.Unlock()
+	// Extract IP address from the full address
+	ip := strings.Split(addr.String(), ":")[0]
+	if count, ok := ln.ipConnCount[ip]; ok {
+		count.Inc()
 	} else {
-		ln.connCount[addr] = 1
-		return ln.connCount[addr]
+		ln.ipConnCount[ip] = atomic.Uint32{}
+		count, _ := ln.ipConnCount[ip]
+
+		count.Inc()
 	}
-	//return ln.connCount.Add(1)
+
+}
+
+func (ln *Listener) decrementConnCount(addr net.Addr) {
+	ln.connCountMu.Lock()
+	ln.connCount.Dec()
+	ln.connCountMu.Unlock()
+
+	ln.ipConnCountMu.Lock()
+	defer ln.ipConnCountMu.Unlock()
+	// Extract IP address from the full address
+	ip := strings.Split(addr.String(), ":")[0]
+
+	if count, ok := ln.ipConnCount[ip]; ok {
+		c := count.Dec()
+		if c == 0 {
+			delete(ln.ipConnCount, ip)
+		}
+	}
+
+}
+
+func (ln *Listener) getIpConnCount(addr net.Addr) uint32 {
+	ln.ipConnCountMu.RLock()
+	defer ln.ipConnCountMu.RUnlock()
+	ip := strings.Split(addr.String(), ":")[0]
+	if count, ok := ln.ipConnCount[ip]; ok {
+		return count.Load()
+	}
+	return 0
+}
+
+func (ln *Listener) getConnCount() uint32 {
+	ln.connCountMu.RLock()
+	defer ln.connCountMu.RUnlock()
+	return ln.connCount.Load()
 }
 
 // just a blocking call waiting for the main listener to be shutdown
+// Run blocks until the listener's context is canceled — by Stop, a parent
+// context, or a fatal accept error — then drains connections gracefully.
+// It does not install signal handlers; signal handling belongs to the
+// application. See RunUntilSignal for the opt-in convenience wrapper.
 func (ln *Listener) Run() {
-	//TO_DO : after sig term, "no use of closed network connection" should be caught and loged
-	go func() {
-		for err := range ln.ErrCh {
-			if ln.Options.Verbose {
-				log.Println(err)
-			}
-		}
-	}()
+	go ln.drainErrors()
 
 	log.Printf("[wireforge] TCP LISTENER STARTED SUCCESSFULLY, Listening on %s", ln.Address)
 
-	quit := make(chan os.Signal, 1)
-	// Catch Ctrl+C (SIGINT) and Docker/K8s stop (SIGTERM)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-ln.ctx.Done()
+	log.Printf("Shutting down listener [%s] gracefully...", ln.Address)
+
+	ln.shutdown()
+
+	log.Printf("TCP Listener [%s] successfully stopped. All connections closed.", ln.Address)
+}
+
+// RunUntilSignal is Run plus opt-in SIGINT/SIGTERM handling: it blocks until
+// one of those signals arrives (or the context is canceled), then shuts down
+// gracefully. A second signal during the drain force-closes all connections
+// instead of waiting out the ShutdownTimeout.
+func (ln *Listener) RunUntilSignal() {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig) // restores the default disposition when we return
+
+	go ln.drainErrors()
+
+	log.Printf("[wireforge] TCP LISTENER STARTED SUCCESSFULLY, Listening on %s", ln.Address)
 
 	select {
-
-	case <-quit:
-		log.Printf(" SIGTERM CAUGHT: tcp listener [%s] is being stoped ", ln.Address)
+	case s := <-sig:
+		log.Printf("%v caught: tcp listener [%s] is being stopped (send again to force)", s, ln.Address)
 	case <-ln.ctx.Done():
 		log.Printf("Shutting down listener [%s] gracefully...", ln.Address)
 	}
 
-	done := make(chan struct{})
-
+	drained := make(chan struct{})
 	go func() {
-		err := ln.Stop(ln.Options.ShutdownTimeout)
-		if err != nil {
-			log.Printf("Error during listener [%s] shutdown: %v", ln.Address, err)
-		}
-		close(done)
+		ln.shutdown()
+		close(drained)
 	}()
 
-	<-done
+	select {
+	case <-drained:
+		log.Printf("TCP Listener [%s] successfully stopped. All connections closed.", ln.Address)
+	case s := <-sig:
+		log.Printf("%v caught during shutdown: force-closing all connections", s)
+		ln.forceCloseAllConns()
+		<-drained // Stop unblocks once the force-closed handlers unwind; still bounded by the timeout
+		log.Printf("TCP Listener [%s] force-stopped.", ln.Address)
+	}
+}
 
-	log.Printf("TCP Listener [%s] successfully stopped. All connections closed.", ln.Address)
+func (ln *Listener) drainErrors() {
+	for err := range ln.ErrCh {
+		if ln.Options.Verbose {
+			log.Println(err)
+		}
+	}
+}
 
+func (ln *Listener) shutdown() {
+	if err := ln.Stop(ln.Options.ShutdownTimeout); err != nil {
+		log.Printf("Error during listener [%s] shutdown: %v", ln.Address, err)
+	}
+}
+
+func (ln *Listener) forceCloseAllConns() {
+	ln.connectionPool.Range(func(key, _ any) bool {
+		if c, ok := key.(net.Conn); ok {
+			c.Close()
+		}
+		return true
+	})
 }
 
 func (ln *Listener) Stop(timeout time.Duration) error {
@@ -440,7 +495,7 @@ func (ln *Listener) Stop(timeout time.Duration) error {
 	// 1. Tell all goroutines to stop
 	ln.cancel()
 
-	defer close(ln.ErrCh) // Close error channel to signal no more errors will be sent
+	defer ln.closeErrCh() // Close error channel to signal no more errors will be sent
 
 	// 2. Close the listener to stop accepting NEW connections
 	var err error
@@ -470,29 +525,20 @@ func (ln *Listener) Stop(timeout time.Duration) error {
 		// The timeout was reached before wg.Wait() finished!
 		log.Printf("[wireforge] :::: Listener Shutdown timeout of %v reached! Forcing Exit.", timeout)
 
-		// Optional: Actively loop through your sync.Map and aggressively close stuck connections
-		ln.ConnectionPool.Range(func(inbounds, outbounds any) bool {
-			if c, ok := inbounds.(net.Conn); ok {
-				c.Close() // Forcefully drop the client
-			}
-			if b, ok := outbounds.(net.Conn); b != nil && ok {
-				b.Close() // Forcefully drop the backend
-			}
-			return true
-		})
-
-		ln.AcceptPool.Range(func(key, value any) bool {
-			if c, ok := key.(net.Conn); ok {
-				c.Close()
-			}
-			return true
-		})
+		ln.forceCloseAllConns()
 
 		return nil
 	}
 }
 
 func (ln *Listener) sendError(err error) {
+	ln.errMu.Lock()
+	defer ln.errMu.Unlock()
+
+	if ln.errClosed {
+		return // shutting down; drop the error
+	}
+
 	select {
 	case ln.ErrCh <- err:
 	default:
@@ -502,30 +548,17 @@ func (ln *Listener) sendError(err error) {
 	}
 }
 
-func (ln *Listener) OnConnect(onConn OnConnectFunc) {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.OnConnect = onConn
-}
+// closeErrCh closes ErrCh exactly once and is safe to call while
+// other goroutines may still be calling sendError.
+func (ln *Listener) closeErrCh() {
+	ln.errMu.Lock()
+	defer ln.errMu.Unlock()
 
-func (ln *Listener) OnDisconnect(onDisconn OnDisconnectFunc) {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.OnDisconnect = onDisconn
-}
-
-func (ln *Listener) OnDisconnectWithTimeout(d time.Duration, onDisconn OnDisconnectFunc) {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.OnDisconnectTimeout = d
-	ln.Options.OnDisconnect = onDisconn
-}
-
-func (ln *Listener) OnConnectWithTimeout(d time.Duration, onConn OnConnectFunc) {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.OnConnectTimeout = d
-	ln.Options.OnConnect = onConn
+	if ln.errClosed {
+		return
+	}
+	ln.errClosed = true
+	close(ln.ErrCh)
 }
 
 func (ln *Listener) Close() error {
@@ -562,10 +595,11 @@ func (lo *ListenOptions) convertToListenConfig() *net.ListenConfig {
 				}
 
 				// 3. TCP_FASTOPEN (Linux specific TCP option)
-				if lo.TCPFastOpen {
-					if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_FASTOPEN, 1); err != nil {
+				if lo.TCPFastOpenQueue > 0 {
+					if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_FASTOPEN, lo.TCPFastOpenQueue); err != nil {
 						socketErr = err
 					}
+
 				}
 			})
 
@@ -604,13 +638,9 @@ func DefaultListenOptions() *ListenOptions {
 
 		ReuseAddr:           true,
 		ReusePort:           false, // Leave false by default unless specifically needed
-		TCPFastOpen:         false,
+		TCPFastOpenQueue:    256,
 		MultipathTCP:        true,
 		Inbounds:            inboundOps,
-		OnConnect:           nil,
-		OnConnectTimeout:    0,
-		OnDisconnect:        nil,
-		OnDisconnectTimeout: 0,
 		ShutdownTimeout:     15 * time.Second,
 		MaxConnectionsPerIP: 0,
 	}
@@ -653,8 +683,8 @@ func (lo *ListenOptions) WithReusePort(v bool) *ListenOptions {
 	return lo
 }
 
-func (lo *ListenOptions) WithFastOpen(v bool) *ListenOptions {
-	lo.TCPFastOpen = v
+func (lo *ListenOptions) WithFastOpen(v int) *ListenOptions {
+	lo.TCPFastOpenQueue = v
 	return lo
 }
 
@@ -692,15 +722,6 @@ func (lo *ListenOptions) WithDeadline(sec time.Duration) *ListenOptions {
 	return lo
 }
 
-func (lo *ListenOptions) WithOnConnectTimeout(sec time.Duration) *ListenOptions {
-	lo.OnConnectTimeout = sec
-	return lo
-}
-
-func (lo *ListenOptions) WithOnDisconnectTimeout(sec time.Duration) *ListenOptions {
-	lo.OnDisconnectTimeout = sec
-	return lo
-}
 func (lo *ListenOptions) WithShutdownTimeout(d time.Duration) *ListenOptions {
 	lo.ShutdownTimeout = d
 	return lo
@@ -711,123 +732,25 @@ func (ln *Listener) updateConfig() {
 	ln.config = ln.Options.convertToListenConfig()
 }
 
-func (ln *Listener) SetVerbose(v bool) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.Verbose = v
-	return ln
-}
+func classifyAcceptError(err error) acceptErrClass {
+	switch {
 
-func (ln *Listener) SetKeepAlive(v bool) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	if ln.isListening {
-		if ln.Options.Verbose {
-			log.Println("[wireforge] WARNING: KeepAlive changes won't affect already-accepted connections")
+	case errors.Is(err, syscall.EMFILE),
+		errors.Is(err, syscall.ENFILE),
+		errors.Is(err, syscall.ENOMEM),
+		errors.Is(err, syscall.ENOBUFS):
+		return acceptErrBackoff
+
+	case errors.Is(err, syscall.ECONNABORTED),
+		errors.Is(err, syscall.EPROTO):
+		return acceptErrRetryNow
+
+	default:
+
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return acceptErrBackoff
 		}
+		return acceptErrFatal
 	}
-	ln.Options.Inbounds.KeepAlive = v
-	ln.updateConfig()
-	return ln
-}
-func (ln *Listener) SetKeepAliveFirstProbe(sec time.Duration) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	if ln.isListening {
-		if ln.Options.Verbose {
-			log.Println("[wireforge] WARNING: KeepAlive changes won't affect already-accepted connections")
-		}
-	}
-	ln.Options.Inbounds.KeepAliveFirstProbe = sec
-	ln.updateConfig()
-	return ln
-}
-
-func (ln *Listener) SetKeepAliveInterval(sec time.Duration) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	if ln.isListening {
-		if ln.Options.Verbose {
-			log.Println("[wireforge] WARNING: KeepAlive changes won't affect already-accepted connections")
-		}
-	}
-	ln.Options.Inbounds.KeepAliveInterval = sec
-	ln.updateConfig()
-	return ln
-}
-
-func (ln *Listener) SetMaxKeepAliveAttempts(count int) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	if ln.isListening {
-		if ln.Options.Verbose {
-			log.Println("[wireforge] WARNING: KeepAlive changes won't affect already-accepted connections")
-		}
-	}
-	ln.Options.Inbounds.MaxKeepAliveAttempts = count
-	ln.updateConfig()
-	return ln
-}
-
-func (ln *Listener) SetReusePort(v bool) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.ReusePort = v
-	ln.updateConfig()
-	return ln
-}
-
-func (ln *Listener) SetMPTCP(v bool) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.MultipathTCP = v
-	ln.updateConfig()
-	return ln
-}
-
-// SetInboundOptions allows updating all connection-specific settings at once
-func (ln *Listener) SetInboundOptions(noDelay bool, rBuf, wBuf, linger int, deadline time.Duration) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.Inbounds.NoDelay = noDelay
-	ln.Options.Inbounds.ReadBuffer = rBuf
-	ln.Options.Inbounds.WriteBuffer = wBuf
-	ln.Options.Inbounds.DrainConnectionOnClose = linger
-	ln.Options.Inbounds.Deadline = deadline
-	return ln
-}
-
-func (ln *Listener) SetDeadline(d time.Duration) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.Inbounds.Deadline = d
-	return ln
-}
-
-func (ln *Listener) SetLinger(sec int) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.Inbounds.DrainConnectionOnClose = sec
-	return ln
-}
-
-func (ln *Listener) SetDrainConnectionOnClose(sec int) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.Inbounds.DrainConnectionOnClose = sec
-	return ln
-}
-
-func (ln *Listener) SetOnConnectTimeout(d time.Duration) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.OnConnectTimeout = d
-	return ln
-}
-
-func (ln *Listener) SetOnDisconnectTimeout(d time.Duration) *Listener {
-	ln.mu.Lock()
-	defer ln.mu.Unlock()
-	ln.Options.OnDisconnectTimeout = d
-	return ln
 }
