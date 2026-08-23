@@ -64,7 +64,7 @@ type ListenOptions struct {
 	ReusePort bool // Leave false by default unless specifically needed, Allow multiple listeners on the same port for multi-core scaling
 
 	//TCPFastOpen  bool
-	TCPFastOpenQueue int  //default 256
+	TCPFastOpenQueue int  //default 256 //first enable tcp fast open in the kernel sysctl -w net.ipv4.tcp_fastopen=3(or 2)
 	MultipathTCP     bool //only works if OS supports
 
 	//the max time the Stop() method can try closing and draining the remaining connections for a graceful shutdown
